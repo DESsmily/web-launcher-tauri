@@ -3,7 +3,7 @@ import { computed } from "vue";
 
 import AppIcon from "../components/AppIcon.vue";
 import type { LaunchConfig } from "../types";
-import { goEditor, notify, startLaunch, ui } from "../lib/session";
+import { goEditor, notify, previewConfig, startLaunch, stopConfig, ui } from "../lib/session";
 import { isRunning, removeConfig, store, toggleDefault } from "../lib/store";
 
 const configs = computed(() => store.configs);
@@ -35,7 +35,8 @@ function requestDelete(config: LaunchConfig): void {
         <div>
           <h2>启动配置</h2>
           <p>
-            共 {{ configs.length }} 个配置，点击「启动」即在新标签页中打开页面。
+            共 {{ configs.length }} 个配置。「启动」会先拉起本地服务再打开页面；
+            预览图标不启动服务，直接打开页面。
           </p>
         </div>
         <button class="btn primary" @click="goEditor()">
@@ -82,10 +83,38 @@ function requestDelete(config: LaunchConfig): void {
           </div>
 
           <div class="actions">
-            <button class="btn primary sm" @click="startLaunch(config)">
-              <AppIcon name="play" :size="12" />
-              启动
+            <!-- 本地启动的配置：由本应用拉起的服务在运行时，启动按钮变停止 -->
+            <template v-if="config.localStart">
+              <button
+                v-if="isRunning(config.id)"
+                class="btn sm"
+                title="停止由本应用拉起的本地服务"
+                @click="stopConfig(config.id)"
+              >
+                <AppIcon name="stop" :size="12" />
+                停止
+              </button>
+              <button
+                v-else
+                class="btn primary sm"
+                title="启动本地服务并打开页面"
+                @click="startLaunch(config)"
+              >
+                <AppIcon name="play" :size="12" />
+                启动
+              </button>
+            </template>
+
+            <!-- 预览：不拉起本地服务，直接打开页面 -->
+            <button
+              class="btn icon sm"
+              v-if="isRunning(config.id) || !config.localStart"
+              title="预览页面（不启动本地服务）"
+              @click="previewConfig(config)"
+            >
+              <AppIcon name="eye" :size="14" />
             </button>
+
             <button
               class="btn icon sm"
               :title="config.isDefault ? '取消默认启动' : '设为默认启动'"

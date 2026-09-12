@@ -65,6 +65,12 @@ const ICONS: Record<string, IconDef> = {
     ],
   },
   stop: { paths: ["M6 6h12v12H6z"], filled: true },
+  eye: {
+    paths: [
+      "M1 12s4-7.5 11-7.5S23 12 23 12s-4 7.5-11 7.5S1 12 1 12z",
+      "M12 15.2a3.2 3.2 0 1 0 0-6.4 3.2 3.2 0 0 0 0 6.4z",
+    ],
+  },
   rocket: {
     paths: [
       "M12 2c3.5 2.2 5.5 6 5.5 10.5L12 16l-5.5-3.5C6.5 8 8.5 4.2 12 2z",

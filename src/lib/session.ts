@@ -2,8 +2,8 @@ import { reactive } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 
 import type { LaunchConfig, LogLine } from "../types";
-import { launchConfig, type LaunchPhase } from "./launch";
-import { findConfig, newId, refreshRunning, store } from "./store";
+import { launchConfig, normalizeUrl, type LaunchPhase } from "./launch";
+import { findConfig, isRunning, newId, refreshRunning, store } from "./store";
 
 export type ViewName = "home" | "editor" | "settings" | "launch";
 
@@ -18,6 +18,12 @@ export const EMBED_TITLE_EVENT = "embed://title";
 
 /** 标签页右键菜单动作事件（对应 Rust 侧 `appmenu::EVT_TAB_MENU`），payload 为 `{ tab, action }` */
 export const TAB_MENU_EVENT = "menu://tab";
+
+/**
+ * 窗口从托盘还原事件（对应 Rust 侧 `lib::RESTORED_EVENT`）。
+ * 隐藏到托盘时内嵌页面被一并隐藏，还原后需要重新同步一次显隐。
+ */
+export const RESTORED_EVENT = "window://restored";
 
 export interface ConfirmState {
   title: string;
@@ -290,6 +296,8 @@ async function runLaunch(tab: TabSession, config: LaunchConfig): Promise<void> {
     tab.running = outcome.spawned;
     tab.phase = "ready";
     tab.message = outcome.spawned ? "本地服务已启动" : "页面已就绪";
+    // 同步全局「运行中」清单：配置列表的启动 / 停止按钮按它切换
+    await refreshRunning();
     await syncEmbedVisibility();
   } catch (error) {
     if (!alive()) return;
@@ -297,6 +305,8 @@ async function runLaunch(tab: TabSession, config: LaunchConfig): Promise<void> {
     tab.error = error instanceof Error ? error.message : String(error);
     tab.message = "启动失败";
     tab.created = false;
+    // 失败也可能已经拉起了进程（例如等端口超时），清单要跟上
+    await refreshRunning();
     await syncEmbedVisibility();
   }
 }
@@ -340,6 +350,86 @@ export async function startLaunch(config: LaunchConfig): Promise<void> {
   ui.view = "launch";
   await syncWindowTitle();
   await runLaunch(tab, config);
+}
+
+/* ------------------------------- 预览与停止 ------------------------------- */
+
+/**
+ * 预览配置：**不拉起本地服务**，直接用内嵌页打开它的访问地址。
+ *
+ * 「直接访问」型配置只有这一个入口；「本地启动」型也留着它，用于
+ * 「服务已经在别处跑着，只想看一眼页面」。所以要跳过整个 launchConfig
+ * 流程（端口探测 / 执行命令 / 等就绪），把标签页直接置成 ready。
+ */
+export async function previewConfig(config: LaunchConfig): Promise<void> {
+  const url = normalizeUrl(config.url);
+  if (!url) {
+    notify("该配置还没有填写有效的访问地址");
+    return;
+  }
+
+  const existing = tabs.list.find((tab) => tab.configId === config.id);
+  if (existing) {
+    // 正在跑启动流程的会话先作废令牌，否则它的回调稍后会把状态改回「启动中」
+    runTokens.delete(existing.id);
+    existing.url = url;
+    existing.title = "";
+    existing.phase = "ready";
+    existing.message = "预览模式（未启动本地服务）";
+    existing.error = "";
+    existing.showLogs = false;
+    // 置回未创建，让 syncEmbedVisibility 走 open_embed 重新导航到这个地址
+    existing.created = false;
+
+    tabs.activeId = existing.id;
+    ui.view = "launch";
+    await syncWindowTitle();
+    await syncEmbedVisibility();
+    return;
+  }
+
+  const created: TabSession = {
+    id: newId(),
+    configId: config.id,
+    configName: config.name || url,
+    url,
+    title: "",
+    phase: "ready",
+    message: "预览模式（未启动本地服务）",
+    error: "",
+    logs: [],
+    running: isRunning(config.id),
+    created: false,
+    showLogs: false,
+  };
+
+  // 同 startLaunch：push 之后必须取回代理再操作
+  const tab = tabs.list[tabs.list.push(created) - 1]!;
+  tabs.activeId = tab.id;
+  ui.view = "launch";
+  await syncWindowTitle();
+  await syncEmbedVisibility();
+}
+
+/**
+ * 停止某个配置的本地服务。
+ *
+ * 只停服务、**不关闭它的标签页**，与「关闭标签页只销毁页面、不停服务」保持对称。
+ * 停止后 `running` 清单会刷新，配置列表里的按钮自动从「停止」变回「启动」。
+ */
+export async function stopConfig(configId: string): Promise<void> {
+  try {
+    await invoke("stop_service", { id: configId });
+  } catch (error) {
+    notify(`停止失败：${String(error)}`);
+    return;
+  }
+
+  for (const tab of tabs.list) {
+    if (tab.configId === configId) tab.running = false;
+  }
+  await refreshRunning();
+  notify("已停止本地服务");
 }
 
 /**

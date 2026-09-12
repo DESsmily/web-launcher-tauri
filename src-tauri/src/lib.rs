@@ -9,7 +9,7 @@ use std::process::Command;
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Manager, RunEvent, State, WindowEvent,
+    AppHandle, Emitter, Manager, RunEvent, State, WindowEvent,
 };
 
 use embed::Insets;
@@ -115,11 +115,35 @@ async fn close_embed(app: AppHandle, tab: String) -> Result<(), String> {
 
 /* ---------------------------------- 窗口控制 --------------------------------- */
 
+/// 窗口从托盘还原后通知前端：按当前视图重新同步一次内嵌页面显隐。
+///
+/// 隐藏到托盘已经不再动内嵌页面（见 `focus_main` 的说明），所以这里只作兜底 ——
+/// 万一隐藏期间前端切过视图，显隐需要按新视图纠正。
+pub const RESTORED_EVENT: &str = "window://restored";
+
 /// 窗口控制按钮（顶栏右侧的最小化 / 最大化 / 关闭）走这些命令。
-/// 关闭必须走 `Window::close()` 以触发 `CloseRequested`，
-/// 让「最小化托盘 / 关闭应用程序」的关闭策略在窗口事件里统一生效。
 fn main_window(app: &AppHandle) -> Result<tauri::Window, String> {
     app.get_window("main").ok_or_else(|| "主窗口不存在".to_string())
+}
+
+/// 隐藏到托盘：**只隐藏主窗口**。
+///
+/// 上一版这里还多调了一次 `embed::hide_all()`，而那正是「托盘还原不了」的来源 ——
+/// 内嵌页面并不是独立窗口，它是主窗口的 `WS_CHILD` 子窗口（wry 用
+/// `CreateWindowExW(..., WS_CHILD, parent=主窗口, ...)` 建的），父窗口 `SW_HIDE`
+/// 之后子窗口本来就不再合成，不需要、也不该再逐个藏一遍。
+///
+/// 逐个藏会凭空造出**两个显隐所有者**：主窗口由 Rust 恢复、内嵌页面得等前端收到
+/// `RESTORED_EVENT` 再 `show_embed()` 才回来。这条 `invoke` 往返里只要断一环，窗口
+/// 回来了内容区也是空的，而且从外面完全看不出断在哪一环。只隐藏主窗口之后，显隐只有
+/// 一个所有者，「还原」退化成一次无条件的 `ShowWindow`。
+///
+/// （切到配置 / 设置 / 编辑视图时仍然走 `embed::hide_all()` —— 那里内嵌页面确实该藏。）
+fn hide_to_tray(app: &AppHandle) {
+    if let Ok(window) = main_window(app) {
+        let _ = window.hide();
+    }
+    log_window_state(app, "hide_to_tray");
 }
 
 #[tauri::command]
@@ -143,9 +167,33 @@ fn window_is_maximized(app: AppHandle) -> Result<bool, String> {
     main_window(&app)?.is_maximized().map_err(|e| e.to_string())
 }
 
+/// 顶栏关闭按钮：按设置里的「关闭操作」当场决定隐藏还是退出。
+///
+/// **这里必须同步判定，不能再借 `Window::close()` 绕一圈 CloseRequested。**
+/// 原因在框架实现里写得很直白（tauri-runtime-wry）：
+/// - `hide()` / `show()` / `minimize()` 走 `send_user_message`，在主线程上会
+///   **内联同步执行**（`if current_thread().id() == context.main_thread_id`）；
+/// - `close()` 是唯一例外，注释明写 "close cannot use the `send_user_message`
+///   function"，只能 `proxy.send_event` → `PostMessageW` **异步投递**到事件循环。
+///
+/// 于是「最小化到托盘」这条路径就多了一次跨线程投递：一旦投递没能及时/成功送达
+/// 事件循环（打开了标签页时消息量本来就大，事件循环还常被内嵌 WebView2 的回调
+/// 占住），命令返回 Err，而前端把错误吞掉了 → 表现为「点关闭没反应」。改成直接
+/// `hide()` 后这条路径和最小化 / 最大化完全一致，不再有可失败的中转。
+///
+/// 关闭策略仍然是「一处判定」：托盘在 `hide_to_tray`，退出交给 `CloseRequested`
+/// 兜底（Alt+F4 / 任务栏关闭也走同一个 `on_window_event` 分支）。
 #[tauri::command]
 fn window_close(app: AppHandle) -> Result<(), String> {
-    main_window(&app)?.close().map_err(|e| e.to_string())
+    let close_action = app.state::<StoreState>().settings().close_action;
+
+    if close_action == CLOSE_ACTION_EXIT {
+        // 退出：走 Window::close() → CloseRequested，由 on_window_event 统一收尾
+        return main_window(&app)?.close().map_err(|e| e.to_string());
+    }
+
+    hide_to_tray(&app);
+    Ok(())
 }
 
 #[tauri::command]
@@ -184,11 +232,121 @@ fn open_external(url: String) -> Result<(), String> {
 
 /* ------------------------------------ 托盘 ----------------------------------- */
 
+/// 从托盘还原主窗口并置前。
+///
+/// 顺序是**先 Win32、后 tao**，两个原因：
+///
+/// 1. tao 的 `show()` 只做 `WindowFlags::VISIBLE` 的 diff，而 `apply_diff()` 第一行
+///    就是 `if diff == empty { return }`：只要 tao 的内部标记已经是「可见」而真实
+///    HWND 还停在 `SW_HIDE`，`show()` 会**静默退化成空操作**。先无条件 Win32 显示、
+///    再让 tao 追状态，两个方向都安全 —— tao 只会把标记修正到与真实一致，之后的
+///    `hide()` 也照旧生效。
+/// 2. `SW_SHOW` 对**被最小化**的窗口不生效（只在当前位置显示），所以这里按
+///    `IsIconic` 分流：最小化过走 `SW_RESTORE`，只是被 `SW_HIDE` 藏起来的才用
+///    `SW_SHOW` —— 反过来一律用 `SW_RESTORE` 会把最大化过的窗口降回普通大小。
+///
+/// 另外这里**不再调 `window.set_focus()`**：tao 的 `set_focus` 在抢不到前台时会走
+/// `force_window_active`，里面用 `SendInput` 合成一次 Alt 按下 / 抬起去骗前台权限。
+/// 那是给「窗口创建」场景写的 hack（框架注释自己也这么写），不该出现在托盘还原这种
+/// 随时会被触发的路径上。
+///
+/// 关键：**不要通过 `app.get_webview_window("main")` 拿窗口**。存在子 webview 且
+/// 主窗口被 `SW_HIDE` 隐藏到托盘后，Tauri 运行时可能暂时丢失「main」这个
+/// WebviewWindow 记录，导致该查找返回 `None` 并让还原逻辑提前 `return`。托盘
+/// 还原只需要操作顶层 HWND，用 `app.get_window("main")` 拿到的 `tauri::Window`
+/// 不受影响，事件也不依赖 WebviewWindow 包装。
 fn focus_main(app: &AppHandle) {
-    if let Some(window) = app.get_webview_window("main") {
-        let _ = window.show();
-        let _ = window.unminimize();
-        let _ = window.set_focus();
+    log_window_state(app, "focus_main enter");
+
+    let Ok(window) = main_window(app) else {
+        log_window_state(app, "focus_main abort: main window not found");
+        return;
+    };
+
+    #[cfg(windows)]
+    if let Ok(handle) = window.hwnd() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            IsIconic, SetForegroundWindow, SetWindowPos, ShowWindow, HWND_TOP, SWP_NOMOVE,
+            SWP_NOSIZE, SWP_SHOWWINDOW, SW_RESTORE, SW_SHOW,
+        };
+
+        let hwnd = handle.0 as *mut core::ffi::c_void;
+        unsafe {
+            ShowWindow(hwnd, if IsIconic(hwnd) != 0 { SW_RESTORE } else { SW_SHOW });
+            // 抬到 Z 序顶部；显式带上 SWP_SHOWWINDOW 是为了绕开
+            // 「系统认为窗口已可见」时的空操作
+            SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+            // 无边框窗口没有标题栏，Windows 的前台锁定会挡掉 tao 内部那次「请求激活」，
+            // 这里在窗口已经可见的前提下直接抢一次
+            SetForegroundWindow(hwnd);
+        }
+    }
+
+    // Win32 已经把窗口显示出来了；这两步只是把 tao 的内部标记追上真实状态，
+    // 保证后续的 hide() 仍然有效
+    let _ = window.show();
+    let _ = window.unminimize();
+
+    log_window_state(app, "focus_main exit");
+
+    // 按当前视图重新同步一次内嵌页面显隐。内嵌页面现在跟着主窗口一起回来了，
+    // 这一步属于兜底：万一隐藏期间前端切过视图，显隐要按新视图纠正。
+    // emit 失败（例如运行时暂时丢了 main webview 记录）也无伤大雅，因为子
+    // webview 是 WS_CHILD，父窗口显示后它们会随 WS_VISIBLE 状态自动恢复。
+    let _ = app.emit_to("main", RESTORED_EVENT, ());
+}
+
+/// 托盘显隐链路的诊断日志（`%APPDATA%\com.weblaunch.app\focus.log`）。
+///
+/// 这个 bug 在开发机上复现不了（内嵌 WebView2 不初始化），而它的表现是「点了没反应」——
+/// 没有任何报错、也没有返回值可以看。所以把链路里的关键事实落盘：窗口**真实**的
+/// 可见 / 最小化 / 前台状态（tao 的 `is_visible()` 读的是内部标记，不是真相，这里一律
+/// 问 Win32）。每次托盘隐藏、每次还原各写两行，开销可以忽略。
+fn log_window_state(app: &AppHandle, tag: &str) {
+    use std::io::Write;
+
+    let Ok(dir) = app.path().app_config_dir() else {
+        return;
+    };
+    let Ok(window) = main_window(app) else {
+        return;
+    };
+    let Ok(handle) = window.hwnd() else {
+        return;
+    };
+
+    #[cfg(windows)]
+    let (visible, minimized, foreground) = {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GetForegroundWindow, IsIconic, IsWindowVisible,
+        };
+        let hwnd = handle.0 as *mut core::ffi::c_void;
+        unsafe {
+            (
+                IsWindowVisible(hwnd) != 0,
+                IsIconic(hwnd) != 0,
+                GetForegroundWindow() == hwnd,
+            )
+        }
+    };
+    #[cfg(not(windows))]
+    let (visible, minimized, foreground) = (true, false, true);
+
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let line = format!(
+        "[{millis}] {tag}: hwnd={:#X} visible={visible} minimized={minimized} foreground={foreground}\n",
+        handle.0 as usize,
+    );
+
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("focus.log"))
+    {
+        let _ = file.write_all(line.as_bytes());
     }
 }
 
@@ -200,6 +358,9 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
 
     let mut builder = TrayIconBuilder::with_id("web-launch-tray")
         .menu(&menu)
+        // 左键 = 还原窗口，右键 = 弹出菜单（默认值 true 会让左键去弹菜单，
+        // 把下面的 Click 处理器彻底架空，表现为「点托盘没反应」）
+        .show_menu_on_left_click(false)
         .tooltip("Web 启动器");
 
     if let Some(icon) = app.default_window_icon() {
@@ -207,14 +368,17 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     }
 
     builder
-        .on_menu_event(|app, event| match event.id().as_ref() {
-            "show" => focus_main(app),
-            "quit" => {
-                let mgr = app.state::<ServiceManager>();
-                service::stop_all(&mgr);
-                app.exit(0);
+        .on_menu_event(|app, event| {
+            log_window_state(app, "tray menu event");
+            match event.id().as_ref() {
+                "show" => focus_main(app),
+                "quit" => {
+                    let mgr = app.state::<ServiceManager>();
+                    service::stop_all(&mgr);
+                    app.exit(0);
+                }
+                _ => {}
             }
-            _ => {}
         })
         .on_tray_icon_event(|tray, event| {
             if let TrayIconEvent::Click {
@@ -223,6 +387,7 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
                 ..
             } = event
             {
+                log_window_state(tray.app_handle(), "tray left click");
                 focus_main(tray.app_handle());
             }
         })
@@ -258,10 +423,10 @@ pub fn run() {
                             .settings()
                             .close_action;
                         if close_action != CLOSE_ACTION_EXIT {
+                            // 兜底路径：Alt+F4 / 任务栏关闭时同样按「最小化到托盘」处理，
+                            // 与顶栏关闭按钮保持完全一致。
                             api.prevent_close();
-                            if let Some(window) = resize_handle.get_webview_window("main") {
-                                let _ = window.hide();
-                            }
+                            hide_to_tray(&resize_handle);
                         }
                     }
                     _ => {}

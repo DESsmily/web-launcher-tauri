@@ -62,6 +62,30 @@ fn hide_others(app: &AppHandle, keep_tab: &str) {
     }
 }
 
+/// 主窗口当前是否真的可见。
+///
+/// 问 Win32 而不是 tao 的 `is_visible()`：后者读的是 tao 自己的内部标记，在「先
+/// `ShowWindow` 再让 tao 追状态」的还原顺序下会短暂失真。`IsWindowVisible` 对顶层窗口
+/// 返回的正是 `WS_VISIBLE` 的真实值。
+#[cfg(windows)]
+fn window_is_visible(app: &AppHandle) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::IsWindowVisible;
+
+    let Some(window) = app.get_window("main") else {
+        return false;
+    };
+    match window.hwnd() {
+        Ok(handle) => unsafe { IsWindowVisible(handle.0 as *mut core::ffi::c_void) != 0 },
+        // 拿不到句柄时按「可见」处理：宁可多做一次重排，也不要让内嵌页面永远停在旧尺寸
+        Err(_) => true,
+    }
+}
+
+#[cfg(not(windows))]
+fn window_is_visible(_app: &AppHandle) -> bool {
+    true
+}
+
 /// 主窗口客户区尺寸（物理像素）。
 ///
 /// 优先问 Win32 要 `GetClientRect`：原生菜单栏是**非客户区**，它会占掉窗口顶部一条，
@@ -102,6 +126,20 @@ pub fn apply_bounds(app: &AppHandle) {
     let Some(window) = app.get_window("main") else {
         return;
     };
+
+    // 主窗口不可见（隐藏到托盘，或正处在隐藏 / 还原的过渡里）时**不去动内嵌页面**。
+    //
+    // wry 的 `set_bounds` / `set_visible` 是同步 COM 调用：它们会 marshal 到 WebView2
+    // 自己的 UI 线程，而那一边在窗口隐藏后并不保证能立刻响应。窗口隐藏时去重排内嵌
+    // 页面本来就没有意义（看不见），却会把这些调用塞进主线程 —— 主线程同时也是
+    // 托盘图标 / 原生菜单的消息泵所在，一旦被拖住，表现就是「点托盘没反应」。
+    //
+    // 因此这里按 Win32 的真实可见性提前返回；还原时 `embed::show()` 会再调一次
+    // `apply_bounds`，那时窗口已经可见，尺寸照常算得出来。
+    if !window_is_visible(app) {
+        return;
+    }
+
     let Some((inner_width, inner_height)) = client_size(app) else {
         return;
     };

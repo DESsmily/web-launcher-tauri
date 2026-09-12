@@ -16,6 +16,7 @@ import {
   EMBED_TITLE_EVENT,
   openInBrowser,
   reloadEmbed,
+  RESTORED_EVENT,
   restartTab,
   startLaunch,
   syncEmbedVisibility,
@@ -23,6 +24,7 @@ import {
   tabs,
   ui,
 } from "./lib/session";
+import { installHoverReset } from "./lib/hover";
 import { defaultConfig, isRunning, loadStore, refreshRunning, store } from "./lib/store";
 
 const bootError = ref("");
@@ -49,6 +51,15 @@ onMounted(async () => {
     await listen<{ tab: string; action: string }>(TAB_MENU_EVENT, (event) => {
       void handleTabMenu(event.payload);
     });
+
+    // 从托盘还原：内嵌页面在隐藏时被一并隐藏过，按当前视图重新同步显隐
+    await listen(RESTORED_EVENT, () => {
+      void syncEmbedVisibility();
+    });
+
+    // 清理残留悬停态：窗口隐藏 / 最小化时 WebView2 收不到 mouseleave，
+    // 顶栏按钮（尤其关闭按钮的红底）会把悬停样式粘到窗口还原之后。
+    await installHoverReset();
 
     const preset = defaultConfig();
     if (preset) {
@@ -106,7 +117,7 @@ async function handleTabMenu(payload: { tab: string; action: string }): Promise<
     </div>
 
     <div v-else class="app-shell">
-      <AppToolbar />
+      <AppToolbar ref="toolbarRef" />
 
       <LaunchView v-if="view === 'launch'" />
       <ConfigEditor v-else-if="view === 'editor'" />
