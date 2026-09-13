@@ -4,8 +4,6 @@ mod frameless;
 mod service;
 mod store;
 
-use std::process::Command;
-
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
@@ -15,9 +13,6 @@ use tauri::{
 use embed::Insets;
 use service::ServiceManager;
 use store::{Store, StoreState, CLOSE_ACTION_EXIT};
-
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /* ---------------------------------- 配置存储 ---------------------------------- */
 
@@ -203,31 +198,23 @@ async fn show_tab_menu(app: AppHandle, tab: String, can_restart: bool) -> Result
 
 /* ---------------------------------- 系统能力 ---------------------------------- */
 
-#[tauri::command]
-fn open_external(url: String) -> Result<(), String> {
+/// 交给系统默认浏览器打开（Windows 走 `ShellExecuteW`）。
+///
+/// 不要再用 `cmd /C start "" <url>`：cmd.exe 会把整条命令行**重新解析一遍**，URL 里
+/// 的 `&`、`^` 会被当成命令分隔符 / 转义符 —— `https://host/?a=1&b=2` 传到浏览器手里
+/// 只剩 `https://host/?a=1`，运气差还能拼出第二条命令。opener 插件底层是
+/// `ShellExecuteW`，参数原样交给 shell，既能正确处理任意 URL，也不经过 shell 解析。
+pub(crate) fn open_in_system_browser(url: &str) -> Result<(), String> {
     let url = url.trim();
     if url.is_empty() {
         return Err("地址为空".to_string());
     }
+    tauri_plugin_opener::open_url(url, None::<&str>).map_err(|e| format!("调用系统浏览器失败：{e}"))
+}
 
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        let mut cmd = Command::new("cmd.exe");
-        cmd.args(["/D", "/C", "start", "", url])
-            .creation_flags(CREATE_NO_WINDOW);
-        cmd.spawn()
-            .map(|_| ())
-            .map_err(|e| format!("调用系统浏览器失败：{e}"))
-    }
-    #[cfg(not(windows))]
-    {
-        let mut cmd = Command::new("xdg-open");
-        cmd.arg(url);
-        cmd.spawn()
-            .map(|_| ())
-            .map_err(|e| format!("调用系统浏览器失败：{e}"))
-    }
+#[tauri::command]
+fn open_external(url: String) -> Result<(), String> {
+    open_in_system_browser(&url)
 }
 
 /* ------------------------------------ 托盘 ----------------------------------- */

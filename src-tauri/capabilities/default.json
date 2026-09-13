@@ -2,7 +2,10 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Capability for the main window",
-  "windows": ["main"],
+  "windows": ["main", "embed-*"],
+  "remote": {
+    "urls": ["http://*:*", "https://*:*", "http://*", "https://*"]
+  },
   "permissions": [
     "core:default",
     "core:window:allow-set-title",
@@ -14,6 +17,14 @@
     "core:window:allow-set-focus",
     "core:window:allow-internal-toggle-maximize",
     "core:window:allow-start-dragging",
-    "opener:default"
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [
+        { "url": "http://*" },
+        { "url": "https://*" },
+        { "url": "mailto:*" },
+        { "url": "tel:*" }
+      ]
+    }
   ]
 }

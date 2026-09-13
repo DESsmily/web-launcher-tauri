@@ -2,7 +2,8 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 use tauri::{
-    AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, Position, Size, WebviewUrl,
+    webview::NewWindowResponse, AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize,
+    Position, Size, WebviewUrl,
 };
 
 /// 内嵌内容 webview 的 label 前缀：每个标签页对应一个独立的 WebView2 实例
@@ -159,6 +160,74 @@ pub fn apply_bounds(app: &AppHandle) {
     }
 }
 
+/// 注入内嵌页面的脚本：拦截 `window.open(...)` 并转成可识别的 `<a target="_blank">` 点击。
+///
+/// 这是 Rust 侧 `on_new_window` 之外的兜底。页面里有些 `window.open` 调用因为
+/// 手势链被异步隔断，WebView2 不会触发 `NewWindowRequested`；把它转成一个
+/// target="_blank" 的链接点击后，opener 插件自带的 JS 脚本会接管并打开系统浏览器。
+/// `<a target="_blank">` 本身则由 opener 插件直接处理，这里不再重复监听，
+/// 避免双重打开或权限冲突。
+const INIT_SCRIPT: &str = r#"
+(function () {
+  if (window.__WEBLAUNCH_JUMP_INSTALLED__) return;
+  window.__WEBLAUNCH_JUMP_INSTALLED__ = true;
+
+  function isExternalUrl(url) {
+    if (typeof url !== 'string') return false;
+    var trimmed = url.trim();
+    if (!trimmed) return false;
+    try {
+      var u = new URL(trimmed, location.href);
+      return u.protocol === 'http:' || u.protocol === 'https:' || u.protocol === 'file:';
+    } catch (_) {
+      return /^https?:\/\//i.test(trimmed) || /^file:/i.test(trimmed);
+    }
+  }
+
+  function shouldInterceptOpen(target) {
+    return target === '_blank' || target === undefined || target === null || target === '';
+  }
+
+  // 把外部新窗口请求转成 target="_blank" 的 a 标签点击，让 opener 插件的 JS 脚本接管
+  function openInBrowser(url) {
+    var a = document.createElement('a');
+    a.href = url;
+    a.target = '_blank';
+    a.rel = 'noopener noreferrer';
+    a.style.display = 'none';
+    (document.body || document.documentElement).appendChild(a);
+    a.click();
+    setTimeout(function () { a.remove(); }, 0);
+  }
+
+  var originalOpen = window.open;
+  window.open = function (url, target, features) {
+    if (typeof url === 'string' && isExternalUrl(url) && shouldInterceptOpen(target)) {
+      openInBrowser(url);
+      return null;
+    }
+    return originalOpen.apply(this, arguments);
+  };
+})();
+"#;
+
+/// 页面请求「新窗口」时，判断是否该转交系统默认浏览器。
+///
+/// `window.open()` 不带参数、或页面自己往空文档里写内容的情况，WebView2 给的 Uri 是
+/// `about:blank` —— 交出去只会弹出一个空白浏览器窗口，直接忽略。其余非浏览器 scheme
+/// （`javascript:`、`data:`、`blob:`、`devtools:` 等）同样不往外抛。
+fn open_in_browser(url: &str) {
+    let trimmed = url.trim();
+    let scheme = trimmed.split(':').next().unwrap_or("").to_ascii_lowercase();
+    if !matches!(scheme.as_str(), "http" | "https" | "file" | "mailto") {
+        return;
+    }
+
+    if let Err(error) = crate::open_in_system_browser(trimmed) {
+        eprintln!("[embed] 系统浏览器打开失败：{error}（{trimmed}）");
+    }
+}
+
 /// 创建（或复用）某个标签页的内嵌 webview 并加载地址
 pub fn open(app: &AppHandle, tab: &str, url: &str, insets: Insets) -> Result<(), String> {
     let parsed = tauri::Url::parse(url).map_err(|e| format!("访问地址无效：{e}"))?;
@@ -187,12 +256,25 @@ pub fn open(app: &AppHandle, tab: &str, url: &str, insets: Insets) -> Result<(),
     let emitter = app.clone();
     let tab_id = tab.to_string();
     let builder = tauri::webview::WebviewBuilder::new(&label, WebviewUrl::External(parsed))
+        // 注入脚本兜底：拦截 window.open / target="_blank" 点击，直接调 open_external
+        .initialization_script(INIT_SCRIPT)
         .on_document_title_changed(move |_webview, title| {
             let _ = emitter.emit_to(
                 "main",
                 TITLE_EVENT,
                 serde_json::json!({ "tab": tab_id.clone(), "title": title }),
             );
+        })
+        // 页面里「在新窗口打开」的跳转（`window.open` / `target="_blank"` /
+        // 表单 `target`）一律转交**系统默认浏览器**，不再在内嵌环境里开第二个窗口。
+        //
+        // 不设这个 handler 时 wry 是**直接把请求吞掉**的：`new_window_req_handler`
+        // 为 None 时只执行 `args.SetHandled(true)` 就返回（webview2/mod.rs），页面
+        // 既不报错也拿不到任何反馈 —— 现象正是「点了跳转没反应」。所以这里必须显式
+        // 接住：先交给系统浏览器，再返回 `Deny` 明确拒绝新建内嵌窗口。
+        .on_new_window(|url, _features| {
+            open_in_browser(url.as_str());
+            NewWindowResponse::Deny
         });
 
     let webview = window

@@ -31,6 +31,12 @@ function setNumber(key: "launchTimeoutSecs" | "probeIntervalMs", raw: number): v
   }
 }
 
+async function openGitHubRepo(): Promise<void> {
+  await invoke("open_external", { url: "https://github.com/DESsmily/web-launcher-tauri/releases" });
+}
+
+
+
 onMounted(async () => {
   try {
     info.value = await invoke("app_info");
@@ -43,82 +49,74 @@ onMounted(async () => {
 <template>
   <div class="scroll-area">
     <div class="page" style="max-width: 680px">
-        <div class="page-head">
-          <h2>设置</h2>
-          <p>调整启动器的窗口行为与启动等待策略。</p>
+      <div class="page-head">
+        <h2>设置</h2>
+        <p>调整启动器的窗口行为与启动等待策略。</p>
+      </div>
+
+      <div class="field">
+        <label>关闭操作</label>
+        <!-- 滑动分段控制器：左右滑动切换“最小化到托盘”与“关闭应用程序” -->
+        <div class="segmented-control" role="radiogroup" aria-label="关闭操作">
+          <input id="close-tray" v-model="closeAction" type="radio" value="tray" />
+          <label for="close-tray" class="segment" :class="{ active: closeAction === 'tray' }">
+            最小化到托盘
+          </label>
+
+          <input id="close-exit" v-model="closeAction" type="radio" value="exit" />
+          <label for="close-exit" class="segment" :class="{ active: closeAction === 'exit' }">
+            关闭应用程序
+          </label>
+
+          <!-- 滑动指示器，随选中项左右移动 -->
+          <div class="slider" :class="{ right: closeAction === 'exit' }"></div>
         </div>
 
-        <div class="field">
-          <label>关闭操作</label>
-          <!-- 滑动分段控制器：左右滑动切换“最小化到托盘”与“关闭应用程序” -->
-          <div class="segmented-control" role="radiogroup" aria-label="关闭操作">
-            <input id="close-tray" v-model="closeAction" type="radio" value="tray" />
-            <label for="close-tray" class="segment" :class="{ active: closeAction === 'tray' }">
-              最小化到托盘
-            </label>
+        <p class="option-desc">
+          {{ closeAction === 'tray'
+            ? '点击关闭时隐藏窗口，应用与已启动的本地服务继续在后台运行，可从托盘图标重新打开。'
+            : '点击关闭时退出应用，并自动结束所有由启动器通过 cmd 拉起的本地服务进程。'
+          }}
+        </p>
+        <span class="hint">默认：最小化到托盘。</span>
+      </div>
 
-            <input id="close-exit" v-model="closeAction" type="radio" value="exit" />
-            <label for="close-exit" class="segment" :class="{ active: closeAction === 'exit' }">
-              关闭应用程序
-            </label>
+      <div class="field">
+        <label>启动等待超时（秒）</label>
+        <input class="input" type="number" min="5" max="3600" :value="store.settings.launchTimeoutSecs"
+          @change="setNumber('launchTimeoutSecs', Number(($event.target as HTMLInputElement).value))" />
+        <span class="hint">执行 cmd 启动命令后，等待服务就绪的最长时间，超时后可点击刷新重试。</span>
+      </div>
 
-            <!-- 滑动指示器，随选中项左右移动 -->
-            <div class="slider" :class="{ right: closeAction === 'exit' }"></div>
+      <div class="field">
+        <label>端口探测间隔（毫秒）</label>
+        <input class="input" type="number" min="150" max="10000" step="50" :value="store.settings.probeIntervalMs"
+          @change="setNumber('probeIntervalMs', Number(($event.target as HTMLInputElement).value))" />
+        <span class="hint">检测本地端口是否已监听的时间间隔，数值越小响应越快、开销略高。</span>
+      </div>
+
+      <div class="field">
+        <label>GitHub 仓库地址</label>
+        <div class="git-link" @click="openGitHubRepo">去查看</div>
+      </div>
+
+      <div class="field">
+        <label>版本</label>
+        <div class="version-card">
+          <div class="version-row">
+            <span>{{ info.name }}</span>
+            <strong>v{{ info.version }}</strong>
           </div>
-
-          <p class="option-desc">
-            {{ closeAction === 'tray'
-              ? '点击关闭时隐藏窗口，应用与已启动的本地服务继续在后台运行，可从托盘图标重新打开。'
-              : '点击关闭时退出应用，并自动结束所有由启动器通过 cmd 拉起的本地服务进程。'
-            }}
-          </p>
-          <span class="hint">默认：最小化到托盘。</span>
-        </div>
-
-        <div class="field">
-          <label>启动等待超时（秒）</label>
-          <input
-            class="input"
-            type="number"
-            min="5"
-            max="3600"
-            :value="store.settings.launchTimeoutSecs"
-            @change="setNumber('launchTimeoutSecs', Number(($event.target as HTMLInputElement).value))"
-          />
-          <span class="hint">执行 cmd 启动命令后，等待服务就绪的最长时间，超时后可点击刷新重试。</span>
-        </div>
-
-        <div class="field">
-          <label>端口探测间隔（毫秒）</label>
-          <input
-            class="input"
-            type="number"
-            min="150"
-            max="10000"
-            step="50"
-            :value="store.settings.probeIntervalMs"
-            @change="setNumber('probeIntervalMs', Number(($event.target as HTMLInputElement).value))"
-          />
-          <span class="hint">检测本地端口是否已监听的时间间隔，数值越小响应越快、开销略高。</span>
-        </div>
-
-        <div class="field">
-          <label>版本</label>
-          <div class="version-card">
-            <div class="version-row">
-              <span>{{ info.name }}</span>
-              <strong>v{{ info.version }}</strong>
-            </div>
-            <div class="version-row muted">
-              <span>Tauri</span>
-              <span>{{ info.tauri }}</span>
-            </div>
-            <div class="version-row muted">
-              <span>渲染内核</span>
-              <span>Microsoft Edge WebView2</span>
-            </div>
+          <div class="version-row muted">
+            <span>Tauri</span>
+            <span>{{ info.tauri }}</span>
+          </div>
+          <div class="version-row muted">
+            <span>渲染内核</span>
+            <span>Microsoft Edge WebView2</span>
           </div>
         </div>
+      </div>
     </div>
   </div>
 </template>
@@ -204,5 +202,10 @@ onMounted(async () => {
 
 .version-row.muted {
   color: var(--text-muted);
+}
+
+.git-link {
+  color: var(--primary);
+  cursor: pointer;
 }
 </style>
