@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type { LaunchConfig, LogLine } from "../types";
 import { launchConfig, normalizeUrl, type LaunchPhase } from "./launch";
 import { findConfig, isRunning, newId, refreshRunning, store } from "./store";
+import { claimMainWebviewFocus } from "./webview-focus";
 
 export type ViewName = "home" | "editor" | "settings" | "launch";
 
@@ -32,6 +33,15 @@ export const RESTORED_EVENT = "window://restored";
  * 导致主界面正在编辑的输入框丢焦点。这个事件专门用来把焦点补回来（见 `lib/focus.ts`）。
  */
 export const FOCUSED_EVENT = "window://focused";
+
+/**
+ * 内嵌页面实例被回收事件（对应 Rust 侧 `embed::EVICTED_EVENT`），payload `{ tab }`。
+ *
+ * 存活的内嵌 webview 有数量上限（每个页面都是一个独立渲染进程，无上限地堆积会把
+ * 主程序一起拖垮）。超限时 Rust 会销毁最久没用过的那个页面，但**标签页保留** ——
+ * 前端收到后把该标签页标记成「未创建」，下次切回去按需重建。
+ */
+export const EMBED_EVICTED_EVENT = "embed://evicted";
 
 export interface ConfirmState {
   title: string;
@@ -177,15 +187,28 @@ async function runSyncEmbedVisibility(): Promise<void> {
   try {
     if (!shouldShow || !tab) {
       await invoke("hide_embeds");
+      // 内嵌页面藏起来之后，键盘焦点可能还留在它身上（子 webview 是独立 HWND，
+      // 抢到焦点后并不会因为被藏起来而自动交还）→ 主界面「点得动、打不了字」。
+      // 只在真的丢了焦点时才去要，正常切换视图不产生额外动作。
+      if (!document.hasFocus()) await claimMainWebviewFocus();
       return;
     }
+
     await invoke("set_embed_insets", { insets: EMBED_INSETS });
-    if (!tab.created) {
-      await invoke("open_embed", { tab: tab.id, url: tab.url, insets: EMBED_INSETS });
-      tab.created = true;
-    } else {
-      await invoke("show_embed", { tab: tab.id });
+
+    if (tab.created) {
+      try {
+        await invoke("show_embed", { tab: tab.id });
+        return;
+      } catch {
+        // 页面实例可能已经被回收（存活数量有上限，见 Rust `embed.rs::MAX_LIVE_EMBEDS`）
+        // 或已随标签页销毁 —— 置回「未创建」，下面按需重建一次。
+        tab.created = false;
+      }
     }
+
+    await invoke("open_embed", { tab: tab.id, url: tab.url, insets: EMBED_INSETS });
+    tab.created = true;
   } catch (error) {
     notify(String(error));
   }
@@ -286,6 +309,19 @@ export function applyPageTitle(tabId: string, title: string): void {
   if (!next || next === tab.title) return;
   tab.title = next;
   if (tabs.activeId === tabId) void syncWindowTitle();
+}
+
+/**
+ * 内嵌页面实例被回收（对应 `embed://evicted`）：标签页还在，只是背后的 webview 被销毁了。
+ *
+ * 被回收的多半是「不活跃」的标签页（Rust 侧按 LRU 挑），但如果正好命中当前显示的那个，
+ * 立刻重建一次 —— 否则用户会对着空白等，直到切视图才恢复。
+ */
+export function applyEmbedEvicted(tabId: string): void {
+  const tab = tabs.list.find((item) => item.id === tabId);
+  if (!tab) return;
+  tab.created = false;
+  if (tab.id === tabs.activeId && ui.view === "launch") void syncEmbedVisibility();
 }
 
 /* ------------------------------ 启动一个配置 ------------------------------ */

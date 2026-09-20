@@ -13,6 +13,9 @@ dist-ssr
 *.local
 target
 
+# 运行期数据（程序目录下的 data/：store.json 与 WebView2 用户数据）
+data
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

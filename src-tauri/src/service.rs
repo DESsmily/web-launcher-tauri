@@ -17,6 +17,17 @@ const PROBE_TIMEOUT: Duration = Duration::from_millis(400);
 pub const EVT_LOG: &str = "service://log";
 pub const EVT_EXIT: &str = "service://exit";
 
+/// 服务相关事件只发给**主 webview**，不要用 `app.emit` 广播。
+///
+/// 监听方（`lib/launch.ts`、`App.vue`）本来就只有主界面这一份；而 `app.emit` 会把每条
+/// 日志都投递到**每一个内嵌页面的子 webview**，那些页面没有任何监听者，却要白白经历
+/// 一次 IPC 投递 + payload 反序列化。开发服务器（vite / webpack）输出又快又多，
+/// 多个标签页同时开着时，这些无用的投递会在子渲染进程里堆成负担 —— 白白把子进程的内存
+/// 顶上去。定向发送把这个 O(日志行数 × 标签页数) 的放大彻底去掉。
+fn emit_main<S: Serialize + Clone>(app: &AppHandle, event: &str, payload: S) {
+    let _ = app.emit_to("main", event, payload);
+}
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LogPayload {
@@ -83,7 +94,9 @@ fn emit_line(app: &AppHandle, id: &str, stream: &str, bytes: &[u8]) {
     if text.is_empty() {
         return;
     }
-    let _ = app.emit(
+    // 只发给主界面，不要 app.emit 广播（见 emit_main 的说明）
+    emit_main(
+        app,
         EVT_LOG,
         LogPayload {
             id: id.to_string(),
@@ -192,7 +205,8 @@ pub fn start(
                 map.remove(&waiter_id);
             }
         }
-        let _ = waiter_app.emit(
+        emit_main(
+            &waiter_app,
             EVT_EXIT,
             ExitPayload {
                 id: waiter_id,

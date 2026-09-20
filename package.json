@@ -1,13 +1,13 @@
 {
   "name": "web-launch",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.3",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc --noEmit && vite build",
     "preview": "vite preview",
-    "verify": "node --experimental-strip-types scripts/verify-url-utils.ts",
+    "verify": "node --experimental-strip-types scripts/verify-url-utils.ts && node --experimental-strip-types scripts/verify-focus-policy.ts",
     "tauri": "tauri"
   },
   "dependencies": {

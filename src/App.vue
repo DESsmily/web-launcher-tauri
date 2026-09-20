@@ -12,7 +12,9 @@ import LaunchView from "./views/LaunchView.vue";
 
 import {
   activateTab,
+  applyEmbedEvicted,
   applyPageTitle,
+  EMBED_EVICTED_EVENT,
   EMBED_TITLE_EVENT,
   openInBrowser,
   openTerminalForTab,
@@ -47,6 +49,11 @@ onMounted(async () => {
     // 内嵌页面的标题由 WebView2 上报，用作标签页名称
     await listen<{ tab: string; title: string }>(EMBED_TITLE_EVENT, (event) => {
       applyPageTitle(event.payload.tab, event.payload.title);
+    });
+
+    // 内嵌页面实例被回收（存活数量超限）：标签页保留，下次切回去按需重建
+    await listen<{ tab: string }>(EMBED_EVICTED_EVENT, (event) => {
+      applyEmbedEvicted(event.payload.tab);
     });
 
     // 标签页右键菜单（重载 / 重新启动 / 在系统浏览器打开）

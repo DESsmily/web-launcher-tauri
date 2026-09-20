@@ -3,6 +3,7 @@ mod embed;
 mod frameless;
 mod service;
 mod store;
+mod winfocus;
 
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
@@ -138,19 +139,20 @@ fn main_window(app: &AppHandle) -> Result<tauri::Window, String> {
     app.get_window("main").ok_or_else(|| "主窗口不存在".to_string())
 }
 
-/// 把系统级键盘焦点要回主界面（主 webview）。
+/// 把键盘焦点要回**主界面**（主 webview）。
+///
+/// 前端只在「不该由内嵌页面拿键盘」时才调它（例如刚把内嵌页面藏起来）。窗口激活时的自动
+/// 归属不走这里 —— 那个按窗口真实显隐判断该归谁，见 [`winfocus::claim_deferred`]。
 ///
 /// 为什么必须由 Rust 来做：DOM 层拿不到「键盘焦点在哪个 webview 上」这件事，
 /// 而 `element.focus()` 在元素已经是 `document.activeElement` 时是空操作 ——
 /// 恰恰最常见的情况就是「DOM 还记得那个输入框，但系统把键盘焦点给了内嵌页面」。
-/// `Webview::set_focus()` 落到底层是 `ICoreWebView2Controller::MoveFocus(Programmatic)`，
-/// 能真正把键盘焦点搬回这个 webview，之后前端再把 DOM 焦点与光标补回具体元素。
+/// 具体怎么抢（以及为什么不能用 `Webview::set_focus()`）见 `winfocus.rs`。
 #[tauri::command]
 fn focus_webview(app: AppHandle) -> Result<(), String> {
-    app.get_webview("main")
-        .ok_or_else(|| "主界面不存在".to_string())?
-        .set_focus()
-        .map_err(|e| e.to_string())
+    // 抢不到不算错误：窗口可能已经不在前台，或者 webview 还没建好。
+    winfocus::claim_main(&app);
+    Ok(())
 }
 
 /// 隐藏到托盘：**只隐藏主窗口**。
@@ -170,7 +172,6 @@ fn hide_to_tray(app: &AppHandle) {
     if let Ok(window) = main_window(app) {
         let _ = window.hide();
     }
-    log_window_state(app, "hide_to_tray");
 }
 
 #[tauri::command]
@@ -275,10 +276,7 @@ fn open_external(url: String) -> Result<(), String> {
 /// 还原只需要操作顶层 HWND，用 `app.get_window("main")` 拿到的 `tauri::Window`
 /// 不受影响，事件也不依赖 WebviewWindow 包装。
 fn focus_main(app: &AppHandle) {
-    log_window_state(app, "focus_main enter");
-
     let Ok(window) = main_window(app) else {
-        log_window_state(app, "focus_main abort: main window not found");
         return;
     };
 
@@ -306,8 +304,6 @@ fn focus_main(app: &AppHandle) {
     let _ = window.show();
     let _ = window.unminimize();
 
-    log_window_state(app, "focus_main exit");
-
     // 按当前视图重新同步一次内嵌页面显隐。内嵌页面现在跟着主窗口一起回来了，
     // 这一步属于兜底：万一隐藏期间前端切过视图，显隐要按新视图纠正。
     // emit 失败（例如运行时暂时丢了 main webview 记录）也无伤大雅，因为子
@@ -315,59 +311,10 @@ fn focus_main(app: &AppHandle) {
     let _ = app.emit_to("main", RESTORED_EVENT, ());
 }
 
-/// 托盘显隐链路的诊断日志（`%APPDATA%\com.weblaunch.app\focus.log`）。
-///
-/// 这个 bug 在开发机上复现不了（内嵌 WebView2 不初始化），而它的表现是「点了没反应」——
-/// 没有任何报错、也没有返回值可以看。所以把链路里的关键事实落盘：窗口**真实**的
-/// 可见 / 最小化 / 前台状态（tao 的 `is_visible()` 读的是内部标记，不是真相，这里一律
-/// 问 Win32）。每次托盘隐藏、每次还原各写两行，开销可以忽略。
-fn log_window_state(app: &AppHandle, tag: &str) {
-    use std::io::Write;
-
-    let Ok(dir) = app.path().app_config_dir() else {
-        return;
-    };
-    let Ok(window) = main_window(app) else {
-        return;
-    };
-    let Ok(handle) = window.hwnd() else {
-        return;
-    };
-
-    #[cfg(windows)]
-    let (visible, minimized, foreground) = {
-        use windows_sys::Win32::UI::WindowsAndMessaging::{
-            GetForegroundWindow, IsIconic, IsWindowVisible,
-        };
-        let hwnd = handle.0 as *mut core::ffi::c_void;
-        unsafe {
-            (
-                IsWindowVisible(hwnd) != 0,
-                IsIconic(hwnd) != 0,
-                GetForegroundWindow() == hwnd,
-            )
-        }
-    };
-    #[cfg(not(windows))]
-    let (visible, minimized, foreground) = (true, false, true);
-
-    let millis = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let line = format!(
-        "[{millis}] {tag}: hwnd={:#X} visible={visible} minimized={minimized} foreground={foreground}\n",
-        handle.0 as usize,
-    );
-
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir.join("focus.log"))
-    {
-        let _ = file.write_all(line.as_bytes());
-    }
-}
+// 这里原来有一份往 `%APPDATA%\<id>\focus.log` 写的诊断日志（`log_window_state` 记窗口
+// 真实可见/最小化/前台状态，`focus_log` 带体积上限地追加），是排查「切屏回来焦点丢失 /
+// 焦点跳到左上角」时加的。问题修好后已整体删除：正常运行时不该往系统盘写这些。
+// 将来还要查这类问题，先看 `winfocus.rs` 模块头的「诊断手段」一节，那里记了怎么重建。
 
 fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     let show_item = MenuItem::with_id(app, "show", "显示主界面", true, None::<&str>)?;
@@ -388,7 +335,6 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
 
     builder
         .on_menu_event(|app, event| {
-            log_window_state(app, "tray menu event");
             match event.id().as_ref() {
                 "show" => focus_main(app),
                 "quit" => {
@@ -406,7 +352,6 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
                 ..
             } = event
             {
-                log_window_state(tray.app_handle(), "tray left click");
                 focus_main(tray.app_handle());
             }
         })
@@ -419,6 +364,24 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // WebView2 的浏览器配置 / 缓存默认落在 `%LOCALAPPDATA%\<exe>.WebView2`（C 盘用户目录）。
+    // 用官方支持的 `WEBVIEW2_USER_DATA_FOLDER` 把它挪到**程序目录**下的 `data/webview2`，
+    // 与 `store.rs::data_dir` 保持同一套「数据跟着程序走、不写系统盘」的约定。
+    //
+    // 必须在**任何 webview 创建之前**设置（`tauri::Builder` 一 build 就会建主窗口的
+    // webview）；写不进去（例如装在 Program Files 且无管理员权限）就不设，
+    // 退回 WebView2 的默认位置。
+    //
+    // 注意：只设这个环境变量、**不要**给个别 webview 单独指定 `data_directory` ——
+    // 那样会让它们用上不同的用户数据目录，等于互不相识（cookie / 登录态都不共享）。
+    #[cfg(windows)]
+    if let Some(dir) = store::install_data_dir() {
+        let webview_dir = dir.join("webview2");
+        if std::fs::create_dir_all(&webview_dir).is_ok() {
+            std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", &webview_dir);
+        }
+    }
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(ServiceManager::default())
@@ -430,6 +393,11 @@ pub fn run() {
             // 无边框窗口补丁：最大化限制到工作区，避免盖住任务栏
             frameless::install(&handle);
 
+            // 键盘焦点路由：顶层窗口拿到焦点时把它转进主 webview。
+            // wry 本来也挂了一条，但它销毁内嵌 webview 时会无条件摘掉（见 winfocus），
+            // 所以这里自己补一条，不依赖它。
+            winfocus::install(&handle);
+
             build_tray(&handle)?;
 
             if let Some(window) = handle.get_window("main") {
@@ -437,11 +405,19 @@ pub fn run() {
                 window.on_window_event(move |event| match event {
                     WindowEvent::Resized(_) => embed::apply_bounds(&resize_handle),
                     WindowEvent::Focused(focused) => {
-                        // 窗口重新被激活：只发事件，不当场抢焦点。
-                        // 抢焦点交给前端——那条 invoke/事件往返天然晚于系统这一轮
-                        // 「把焦点还给最后活动的子窗口」，时机反而更稳（见 lib/focus.ts）。
+                        // 窗口重新被激活，两件事都要做：
+                        // 1. 通知前端把 DOM 焦点与光标补回具体元素 —— 只有前端知道用户
+                        //    之前在编辑哪个输入框、光标停在哪；
+                        // 2. Rust 侧把**系统级**键盘焦点交给该拿它的那个 webview（内嵌页面
+                        //    显示着就归它，否则归主 webview）。不能只依赖前端那次 invoke
+                        //    往返：系统把焦点还给谁与各 WebView2 各自要焦点都是异步的，
+                        //    单发一次会被盖掉，必须事后校验、按几个时间点补刀（见 winfocus）。
+                        //
+                        // 注意这里**不判断**「内嵌页面是否显示着」：归属由 winfocus 按容器
+                        // HWND 的真实显隐去问窗口本身，免得标志位和真实显隐不一致。
                         if *focused {
                             let _ = resize_handle.emit_to("main", FOCUSED_EVENT, ());
+                            winfocus::claim_deferred(&resize_handle);
                         }
                     }
                     WindowEvent::CloseRequested { api, .. } => {
