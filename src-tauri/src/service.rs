@@ -229,3 +229,54 @@ pub fn stop_all(mgr: &ServiceManager) {
         kill_tree(pid);
     }
 }
+
+/* --------------------------------- 打开终端 --------------------------------- */
+
+/// 校验工作目录：留空表示用默认目录，填了就必须真实存在。
+///
+/// 目录不存在时宁可报错也不要静默退回默认目录 —— 用户点「打开终端」就是冲着
+/// 项目目录去的，悄悄开在别处反而更难发现。
+fn resolve_cwd(cwd: Option<&str>) -> Result<Option<&str>, String> {
+    let Some(dir) = cwd.map(str::trim).filter(|dir| !dir.is_empty()) else {
+        return Ok(None);
+    };
+    if !std::path::Path::new(dir).is_dir() {
+        return Err(format!("工作目录不存在：{dir}"));
+    }
+    Ok(Some(dir))
+}
+
+/// 打开一个 cmd 终端窗口，工作目录为 `cwd`（为空则用启动器自身的工作目录）。
+///
+/// 几个要点：
+/// - 目录走 `Command::current_dir` 而**不是**拼进命令行，路径里的空格 / 中文 / `&`
+///   都不必再操心转义（对照 `shell()` 那条走 cmd 解析的老路，那边必须小心引号）。
+/// - `CREATE_NEW_CONSOLE`：启动器是 GUI 程序，本身没有控制台，新开的 cmd 必须自己
+///   带一个窗口，否则进程起来了却看不见。
+/// - `/D` 跳过 AutoRun 注册表项，`/S` 让 cmd 按规则剥掉外层引号，`/K` 执行后保留窗口。
+///   带上 `chcp 65001` 与启动流程保持一致：node / npm / vite 这类工具输出的是 UTF-8，
+///   控制台停在默认的 936 时中文会乱码。
+#[cfg(windows)]
+pub fn open_terminal(cwd: Option<&str>) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+
+    let dir = resolve_cwd(cwd)?;
+
+    let mut cmd = Command::new("cmd.exe");
+    cmd.arg("/D").arg("/S").arg("/K").arg("chcp 65001>nul");
+    if let Some(dir) = dir {
+        cmd.current_dir(dir);
+    }
+    cmd.creation_flags(CREATE_NEW_CONSOLE);
+
+    cmd.spawn().map_err(|e| format!("打开终端失败：{e}"))?;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn open_terminal(cwd: Option<&str>) -> Result<(), String> {
+    resolve_cwd(cwd)?;
+    Err("打开终端目前仅支持 Windows".to_string())
+}

@@ -25,6 +25,14 @@ export const TAB_MENU_EVENT = "menu://tab";
  */
 export const RESTORED_EVENT = "window://restored";
 
+/**
+ * 窗口重新获得焦点事件（对应 Rust 侧 `lib::FOCUSED_EVENT`）。
+ *
+ * 多实例 WebView2 下，窗口重新激活时系统可能把键盘焦点还给某个内嵌子 webview，
+ * 导致主界面正在编辑的输入框丢焦点。这个事件专门用来把焦点补回来（见 `lib/focus.ts`）。
+ */
+export const FOCUSED_EVENT = "window://focused";
+
 export interface ConfirmState {
   title: string;
   message: string;
@@ -149,12 +157,22 @@ export async function activateTab(id: string): Promise<void> {
  * 把内嵌页面的显隐收敛到一处：只有「当前视图是标签页视图 + 该标签已就绪 + 没在看日志」
  * 时才显示对应实例，其余情况一律隐藏（子 webview 是独立 HWND，永远盖在 HTML 之上）。
  */
+/**
+ * 当前该不该由内嵌页面占据内容区。
+ *
+ * 「显隐」判定只此一处：`syncEmbedVisibility` 与 `lib/focus.ts`（判断键盘焦点该归谁）
+ * 都读它，避免两边条件写歪之后出现「页面藏了但焦点没还回来」这类错位。
+ */
+export function embedShouldBeVisible(): boolean {
+  const tab = activeTab();
+  return ui.view === "launch" && !!tab && tab.phase === "ready" && !tab.showLogs && !!tab.url;
+}
+
 let syncChain: Promise<void> = Promise.resolve();
 
 async function runSyncEmbedVisibility(): Promise<void> {
   const tab = activeTab();
-  const shouldShow =
-    ui.view === "launch" && !!tab && tab.phase === "ready" && !tab.showLogs && !!tab.url;
+  const shouldShow = embedShouldBeVisible();
 
   try {
     if (!shouldShow || !tab) {
@@ -211,6 +229,25 @@ export async function openInBrowser(): Promise<void> {
     await invoke("open_external", { url });
   } catch (error) {
     notify(String(error));
+  }
+}
+
+/**
+ * 在标签页对应配置的**工作目录**下打开一个终端。
+ *
+ * 目录只在「本地启动 + 填了工作目录」时才拿得到：非本地启动的配置、或者没填目录的配置，
+ * 都传 `null` 让 Rust 用默认目录（启动器自身的工作目录）打开 —— 这两种情况在用户看来
+ * 是一样的「没有目录就默认」。
+ */
+export async function openTerminalForTab(tabId: string): Promise<void> {
+  const config = findConfig(findTab(tabId)?.configId ?? "");
+  const cwd = config?.localStart && config.cwd.trim() ? config.cwd.trim() : null;
+
+  try {
+    await invoke("open_terminal", { cwd });
+    notify(cwd ? `已在 ${cwd} 打开终端` : "已打开终端");
+  } catch (error) {
+    notify(`打开终端失败：${String(error)}`);
   }
 }
 

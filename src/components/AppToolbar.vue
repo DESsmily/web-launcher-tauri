@@ -121,7 +121,7 @@ const logsOn = computed(() => !!activeTab()?.showLogs && ui.view === "launch");
           <span v-if="item.phase !== 'ready'" class="tab-state" :class="item.phase === 'error' ? 'err' : 'busy'" />
           <span class="tab-title">{{ tabLabel(item) }}</span>
           <button v-hover class="tab-close" title="关闭标签页" @click.stop="closeTab(item.id)">
-            <AppIcon name="close" :size="12" />
+            <AppIcon style="flex-shrink: 0;" name="close" :size="12" />
           </button>
         </div>
 

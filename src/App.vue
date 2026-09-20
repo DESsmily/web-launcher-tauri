@@ -15,6 +15,7 @@ import {
   applyPageTitle,
   EMBED_TITLE_EVENT,
   openInBrowser,
+  openTerminalForTab,
   reloadEmbed,
   RESTORED_EVENT,
   restartTab,
@@ -24,6 +25,7 @@ import {
   tabs,
   ui,
 } from "./lib/session";
+import { installFocusRestore } from "./lib/focus";
 import { installHoverReset } from "./lib/hover";
 import { defaultConfig, isRunning, loadStore, refreshRunning, store } from "./lib/store";
 
@@ -61,6 +63,10 @@ onMounted(async () => {
     // 顶栏按钮（尤其关闭按钮的红底）会把悬停样式粘到窗口还原之后。
     await installHoverReset();
 
+    // 保住主界面输入框的焦点：窗口重新激活时，键盘焦点可能被内嵌页面的
+    // WebView2 抢走（详见 lib/focus.ts）。
+    await installFocusRestore();
+
     const preset = defaultConfig();
     if (preset) {
       await startLaunch(preset);
@@ -81,10 +87,17 @@ function syncRunningFlags(): void {
 }
 
 /**
- * 标签页原生右键菜单动作分发：reload（重载）始终存在；restart 仅当 Rust 端按
- * `can_restart` 判断后才加入菜单里；browser 用系统浏览器打开该标签页地址。
+ * 标签页原生右键菜单动作分发。
+ *
+ * `terminal` 只跟「那个标签页的配置」有关，直接就办了，不切视图；
+ * 其余动作（reload / restart / browser）作用在当前视图上，所以先切到用户点击的标签页。
  */
 async function handleTabMenu(payload: { tab: string; action: string }): Promise<void> {
+  if (payload.action === "terminal") {
+    await openTerminalForTab(payload.tab);
+    return;
+  }
+
   // 用户点击的标签页可能不是当前激活的那一个，先切过去
   if (payload.tab !== tabs.activeId) {
     await activateTab(payload.tab);

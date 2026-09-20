@@ -75,6 +75,15 @@ fn running_services(mgr: State<'_, ServiceManager>) -> Vec<String> {
     mgr.list()
 }
 
+/// 在指定目录下打开一个终端窗口。
+///
+/// `cwd` 由前端决定（标签页对应配置的工作目录；非本地启动 / 未填目录时传 `None`），
+/// Rust 侧只负责校验目录是否存在并拉起 `cmd.exe`，见 `service::open_terminal`。
+#[tauri::command]
+fn open_terminal(cwd: Option<String>) -> Result<(), String> {
+    service::open_terminal(cwd.as_deref())
+}
+
 /* --------------------------------- 内嵌 WebView -------------------------------- */
 
 #[tauri::command]
@@ -116,9 +125,32 @@ async fn close_embed(app: AppHandle, tab: String) -> Result<(), String> {
 /// 万一隐藏期间前端切过视图，显隐需要按新视图纠正。
 pub const RESTORED_EVENT: &str = "window://restored";
 
+/// 窗口重新获得焦点事件（Rust -> 主界面）。
+///
+/// 多实例 WebView2 下，窗口重新激活时系统可能把键盘焦点还给某个内嵌子 webview
+/// （wry 给每个 webview 的 HWND 都挂了「收到 `WM_SETFOCUS` 就 `MoveFocus`」的子类过程），
+/// 主界面正在编辑的输入框会跟着丢焦点。这个事件让前端把焦点补回来，
+/// 见 `src/lib/focus.ts`。
+pub const FOCUSED_EVENT: &str = "window://focused";
+
 /// 窗口控制按钮（顶栏右侧的最小化 / 最大化 / 关闭）走这些命令。
 fn main_window(app: &AppHandle) -> Result<tauri::Window, String> {
     app.get_window("main").ok_or_else(|| "主窗口不存在".to_string())
+}
+
+/// 把系统级键盘焦点要回主界面（主 webview）。
+///
+/// 为什么必须由 Rust 来做：DOM 层拿不到「键盘焦点在哪个 webview 上」这件事，
+/// 而 `element.focus()` 在元素已经是 `document.activeElement` 时是空操作 ——
+/// 恰恰最常见的情况就是「DOM 还记得那个输入框，但系统把键盘焦点给了内嵌页面」。
+/// `Webview::set_focus()` 落到底层是 `ICoreWebView2Controller::MoveFocus(Programmatic)`，
+/// 能真正把键盘焦点搬回这个 webview，之后前端再把 DOM 焦点与光标补回具体元素。
+#[tauri::command]
+fn focus_webview(app: AppHandle) -> Result<(), String> {
+    app.get_webview("main")
+        .ok_or_else(|| "主界面不存在".to_string())?
+        .set_focus()
+        .map_err(|e| e.to_string())
 }
 
 /// 隐藏到托盘：**只隐藏主窗口**。
@@ -404,6 +436,14 @@ pub fn run() {
                 let resize_handle = handle.clone();
                 window.on_window_event(move |event| match event {
                     WindowEvent::Resized(_) => embed::apply_bounds(&resize_handle),
+                    WindowEvent::Focused(focused) => {
+                        // 窗口重新被激活：只发事件，不当场抢焦点。
+                        // 抢焦点交给前端——那条 invoke/事件往返天然晚于系统这一轮
+                        // 「把焦点还给最后活动的子窗口」，时机反而更稳（见 lib/focus.ts）。
+                        if *focused {
+                            let _ = resize_handle.emit_to("main", FOCUSED_EVENT, ());
+                        }
+                    }
                     WindowEvent::CloseRequested { api, .. } => {
                         let close_action = resize_handle
                             .state::<StoreState>()
@@ -432,6 +472,7 @@ pub fn run() {
             stop_service,
             stop_all_services,
             running_services,
+            open_terminal,
             open_embed,
             set_embed_insets,
             show_embed,
@@ -443,6 +484,7 @@ pub fn run() {
             window_toggle_maximize,
             window_is_maximized,
             window_close,
+            focus_webview,
             open_external,
         ])
         .on_menu_event(|app, event| {

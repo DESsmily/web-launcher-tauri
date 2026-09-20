@@ -463,9 +463,12 @@ select {
 .tab .tab-close {
   width: 18px;
   height: 18px;
-  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* flex: none;
   display: grid;
-  place-items: center;
+  place-items: center; */
   border: none;
   border-radius: 5px;
   background: transparent;
@@ -555,33 +558,64 @@ select {
 
 /* --------------------------------- 配置列表 -------------------------------- */
 
-.list {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
+/* 卡片网格：按窗口宽度自适应列数，窄窗口自动退回单列 */
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(268px, 1fr));
+  gap: 14px;
 }
 
 .card {
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
-  padding: 14px 16px;
-  display: flex;
-  align-items: center;
-  gap: 14px;
   box-shadow: var(--shadow);
-  transition: border-color 0.15s ease, transform 0.12s ease;
+  transition: border-color 0.15s ease, transform 0.12s ease, box-shadow 0.15s ease;
 }
 
-.card:hover {
+/* 配置卡片：竖排「头 / 正文 / 操作条」，整张卡片就是一个大按钮 */
+.config-card {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 14px;
+  cursor: pointer;
+  outline: none;
+}
+
+/* 悬停用 `.is-hover`（`v-hover` 指令维护）而不是 `:hover`：窗口隐藏到托盘时
+ * WebView2 收不到 pointerleave，`:hover` 会粘住，还原后卡片一直保持抬起状态。 */
+.config-card.is-hover {
   border-color: var(--border-strong);
+  transform: translateY(-1px);
 }
 
-.card.is-default {
+.config-card:active {
+  transform: translateY(0);
+}
+
+.config-card:focus-visible {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px var(--primary-soft);
+}
+
+.config-card.is-default {
   border-color: var(--primary);
 }
 
-.card .avatar {
+/* 运行中：绿色描边 + 头像变色，从一堆卡片里一眼能认出来 */
+.config-card.is-running {
+  border-color: var(--success);
+}
+
+.config-card .card-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  min-width: 0;
+}
+
+.config-card .avatar {
   width: 40px;
   height: 40px;
   flex: none;
@@ -594,42 +628,85 @@ select {
   background: var(--primary-soft);
 }
 
-.card .info {
+.config-card.is-running .avatar {
+  color: var(--success);
+  background: var(--success-soft);
+}
+
+.config-card .head-text {
   flex: 1;
   min-width: 0;
 }
 
-.card .name-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 3px;
-  flex-wrap: wrap;
-}
-
-.card .name {
+.config-card .name {
   font-weight: 600;
   font-size: 14.5px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  max-width: 320px;
 }
 
-.card .url {
+.config-card .tags {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 4px;
+}
+
+.config-card .live-dot {
+  width: 6px;
+  height: 6px;
+  flex: none;
+  border-radius: 50%;
+  background: currentColor;
+  animation: pulse 1.4s ease-in-out infinite;
+}
+
+.config-card .card-body {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
   color: var(--text-muted);
   font-size: 12.5px;
+}
+
+.config-card .meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.config-card .meta svg {
+  flex: none;
+  opacity: 0.7;
+}
+
+.config-card .ellipsis {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   font-family: "Cascadia Mono", Consolas, monospace;
 }
 
-.card .actions {
+.config-card .card-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: auto;
+  padding-top: 11px;
+  border-top: 1px dashed var(--border);
+}
+
+.config-card .primary-action,
+.config-card .tools {
   display: flex;
   align-items: center;
   gap: 6px;
-  flex: none;
 }
 
 .empty {
